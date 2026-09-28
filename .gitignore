@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+preco_site_dados/
+preco_site_*.xlsx
