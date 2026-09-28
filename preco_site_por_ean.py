@@ -36,6 +36,7 @@ Uso:
   python preco_site_por_ean.py acelera.xlsx           # Acelera: EAN x cliente da linha
   python preco_site_por_ean.py --tudo                 # refaz tudo (ignora o cache)
   python preco_site_por_ean.py --so ARAUJO NISSEI     # só esses clientes
+  python preco_site_por_ean.py --liberados            # só os EANs com TIPO = LIBERADO na régua
   python preco_site_por_ean.py --ver                  # navegador visível (ajuda quando o site bloqueia)
   python preco_site_por_ean.py --mobile               # emula celular (Android/Chrome): site mais simples, menos bloqueio
   python preco_site_por_ean.py --passadas 3           # mais uma rodada em cima do que ficou sem preço
@@ -3064,11 +3065,15 @@ def _formata_aba(ws, df: pd.DataFrame, aba: str):
                     c.fill = vermelho
 
 
-ARQ_PARCIAL = Path("preco_site_PARCIAL.xlsx")
+PREFIXO_EXCEL = "preco_site"      # vira "preco_site_LIBERADOS" com --liberados: os dois Excels não se misturam
+
+
+def arq_parcial() -> Path:
+    return Path(f"{PREFIXO_EXCEL}_PARCIAL.xlsx")
 
 
 def salva_excel(abas: dict, parcial: bool = False) -> Optional[Path]:
-    nome = str(ARQ_PARCIAL) if parcial else f"preco_site_{datetime.now():%Y%m%d_%H%M}.xlsx"
+    nome = str(arq_parcial()) if parcial else f"{PREFIXO_EXCEL}_{datetime.now():%Y%m%d_%H%M}.xlsx"
     for n in range(1 if parcial else 20):
         destino = Path(nome if n == 0 else nome.replace(".xlsx", f"_{n}.xlsx"))
         if destino.exists() and not parcial:      # rodou de novo no mesmo minuto: não sobrescreve
@@ -3113,7 +3118,7 @@ def gera_relatorio(alvos, ignorados, cache, historico, metodos, parcial: bool = 
         return destino
     if destino:
         try:
-            ARQ_PARCIAL.unlink()                  # o final substitui o parcial
+            arq_parcial().unlink()                  # o final substitui o parcial
         except OSError:
             pass
         log.info(f"\nSalvo em {destino}  |  com preço: {int(precos['PREÇO SITE'].notna().sum())} de {len(precos)}"
@@ -3323,6 +3328,15 @@ def main(args) -> int:
     log.info(f"Preço site por EAN v9  |  {datetime.now():%d/%m/%Y %H:%M}  |  pasta: {Path.cwd()}")
     alvos, ignorados = le_base(acha_planilha(args.arquivo))
     alvos = filtra_clientes(alvos, args.so)
+    if args.liberados:
+        global PREFIXO_EXCEL
+        if "TIPO" not in alvos.columns:
+            log.info("\n>>> --liberados precisa da régua (coluna TIPO); esta planilha não tem.\n")
+            return 1
+        tipos = alvos["TIPO"].map(sem_acento)
+        alvos = alvos[tipos == "LIBERADO"].reset_index(drop=True)
+        PREFIXO_EXCEL = "preco_site_LIBERADOS"
+        log.info(f"Só os LIBERADOS (coluna TIPO): {alvos['EAN'].nunique()} EAN(s)")
     if args.limite:
         alvos = alvos.groupby("CLIENTE", sort=False).head(args.limite).reset_index(drop=True)
     if alvos.empty:
@@ -3535,6 +3549,8 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Preço site por EAN — consulta o preço de cada EAN no e-commerce de cada cliente")
     p.add_argument("arquivo", nargs="?", help="régua de preços (EANs sem cliente) ou Acelera (CLIENTE|EAN|SKU); sem nome, acha sozinho na pasta")
     p.add_argument("--so", nargs="+", metavar="CLIENTE", help="só estes clientes")
+    p.add_argument("--liberados", action="store_true",
+                   help="só os EANs com TIPO = LIBERADO na régua (Excel sai como preco_site_LIBERADOS_...)")
     p.add_argument("--testar", nargs="+", metavar="CLIENTE_EAN", help="ex.: --testar PAGUE MENOS 7896004707037")
     p.add_argument("--mapear-api", nargs="+", metavar="CLIENTE_EAN",
                    help="mostra os JSONs que o site chama (onde está o preço): --mapear-api NISSEI 7896004707037")
