@@ -6,6 +6,9 @@ Novo na v9:
     uma consulta em andamento — para o site nada muda; a rodada termina em fração do tempo.
   • Excel parcial (preco_site_PARCIAL.xlsx) regravado a cada 15 min durante a rodada.
   • fuso de Brasília automático (o Colab roda em UTC e datava a coleta noturna como "amanhã").
+  • "CAIXA DE BUSCA NÃO LOCALIZADA" bem menos frequente: espera a caixa montar, tira pop-ups da frente,
+    reconhece página de bloqueio e, sem caixa nenhuma, testa as URLs de busca das plataformas comuns
+    (e aprende a que funcionar).
 
 Aceita dois tipos de planilha (detecta sozinho):
   • RÉGUA DE PREÇOS (ex.: "Busca preços - Atualizado.xlsx", aba NOVA RÉGUA): lista de EANs SEM cliente.
@@ -1276,6 +1279,18 @@ SELETORES_BUSCA = ['input[type="search"]', 'input[name="q"]', 'input[name="w"]',
                    'input[placeholder*="esquis" i]', 'input[placeholder*="que voc" i]',
                    'input[aria-label*="usca" i]', 'input[aria-label*="esquis" i]']
 
+# Sem caixa de busca visível: URLs de busca das plataformas de e-commerce mais comuns. O robô testa cada uma
+# e só aceita a que devolve uma página que mostra o termo buscado — aí aprende e passa a usar direto.
+PADROES_BUSCA = ["/busca?q={termo}", "/busca?termo={termo}", "/busca?busca={termo}", "/busca/?q={termo}",
+                 "/pesquisa?t={termo}", "/pesquisa?q={termo}", "/pesquisa/{termo}",
+                 "/search?q={termo}", "/search?w={termo}", "/buscar?q={termo}",
+                 "/catalogsearch/result/?q={termo}",                        # Magento
+                 "/{termo}?_q={termo}&map=ft",                              # VTEX (loja sem API pública)
+                 "/loja/busca.php?palavra_busca={termo}",                    # Tray
+                 "/busca.asp?PalavraChave={termo}",
+                 "/?s={termo}&post_type=product"]                           # WooCommerce
+TEMPO_CAIXA_BUSCA = 8             # s esperando a caixa de busca aparecer (páginas que montam tudo por JavaScript)
+
 # No celular a caixa de busca costuma ficar escondida atrás de uma lupa: clicar nisso primeiro.
 BOTOES_ABRIR_BUSCA = ['[aria-label*="usca" i]', '[aria-label*="esquis" i]', '[aria-label*="search" i]',
                       'button[class*="search" i]', 'button[class*="busca" i]', 'button[class*="lupa" i]',
@@ -1678,10 +1693,55 @@ class Navegador:
         return False
 
     def _campo_busca(self):
-        campo = self._procura_input_visivel()
-        if campo is None and self._abre_busca_escondida():
+        """Acha a caixa de busca, esperando a página terminar de montar e tirando pop-ups da frente."""
+        limite = time.time() + TEMPO_CAIXA_BUSCA
+        rodada = 0
+        while True:
             campo = self._procura_input_visivel()
-        return campo
+            if campo is None and self._abre_busca_escondida():
+                campo = self._procura_input_visivel()
+            if campo is not None or time.time() >= limite:
+                return campo
+            rodada += 1
+            self._fecha_popups()                    # aviso de cookies / CEP / "escolha sua loja" cobrindo a caixa
+            if rodada == 2:
+                try:
+                    self.page.mouse.wheel(0, -2000)  # cabeçalho que some ao rolar a página
+                except Exception:
+                    pass
+            self.page.wait_for_timeout(800)
+
+    # domínios em que nenhum padrão de URL de busca funcionou nesta execução (vale para todos os trabalhadores)
+    _sem_padrao_busca: set = set()
+
+    def _busca_por_padroes(self, base: str, termo: str) -> bool:
+        """Sem caixa de busca: testa as URLs de busca das plataformas comuns. Aprende a que funcionar."""
+        dom = dominio(base)
+        if dom in Navegador._sem_padrao_busca:
+            return False
+        for padrao in PADROES_BUSCA:
+            modelo = base + padrao
+            try:
+                codigo = self._abrir(monta_url_busca(modelo, termo))
+            except ErroRede:
+                continue
+            if codigo is not None and codigo >= 400:
+                continue
+            if self._bloqueado():
+                return False                         # bloqueio não é culpa do padrão: não marca o site
+            try:
+                texto = self.page.evaluate("() => (document.body && document.body.innerText || '')") or ""
+            except Exception:
+                texto = ""
+            # a página de resultado repete o termo ("resultados para 7894...") e não voltou para a home
+            if termo in texto and dominio(self.page.url) == dom and self.page.url.rstrip("/") != base:
+                self.busca_aprendida[dom] = modelo
+                log.info(f"  ({dom}: sem caixa de busca; aprendi a URL de busca -> {modelo})")
+                return True
+        Navegador._sem_padrao_busca.add(dom)
+        log.info(f"  ({dom}: não achei a caixa de busca nem uma URL de busca que funcione — "
+                 f"rode --testar com --debug e veja o print em {PASTA_DEBUG}/)")
+        return False
 
     def _pesquisar(self, cfg: dict, termo: str):
         """Faz a busca (URL direta ou caixa de busca). Devolve True ou um status de erro."""
@@ -1689,6 +1749,7 @@ class Navegador:
         dom = dominio(base)
         modelo = cfg.get("busca") or self.busca_aprendida.get(dom)
         self.url_digitada = None
+        barrou = None                                       # HTTP de bloqueio que a URL de busca devolveu
         if modelo:
             if base not in self.aquecidos:                  # 1ª visita: home antes, para pegar cookies
                 self._abrir(base)
@@ -1697,6 +1758,8 @@ class Navegador:
             codigo = self._abrir(monta_url_busca(modelo, termo))
             if codigo is None or codigo < 400 or codigo == 404:
                 return True
+            if codigo in (401, 403, 429, 503):
+                barrou = codigo                             # ainda tenta pela caixa; se ela falhar, é bloqueio
             log.debug(f"{dom}: busca por URL respondeu HTTP {codigo}; tentando pela caixa de busca")
             if not cfg.get("busca"):
                 self.busca_aprendida.pop(dom, None)         # o modelo aprendido parou de funcionar
@@ -1704,11 +1767,27 @@ class Navegador:
         self.aquecidos.add(base)
         if codigo and codigo >= 400:
             return f"SITE RESPONDEU HTTP {codigo} (tente --ver)"
+        if self._bloqueado():
+            return BLOQUEADO
         campo = self._campo_busca()
         if campo is None:
+            if self._bloqueado():
+                return BLOQUEADO
+            if barrou:
+                # o problema real é o bloqueio da busca, não a caixa: status temporário, a agenda espera e tenta de novo
+                return f"SITE RESPONDEU HTTP {barrou}"
+            if not cfg.get("busca") and self._busca_por_padroes(base, termo):
+                return True
             return CAIXA_BUSCA
         try:
-            campo.click(timeout=3000)
+            try:
+                campo.click(timeout=3000)
+            except Exception:
+                self._fecha_popups()                    # algo na frente da caixa (modal de CEP, cookies...)
+                try:
+                    campo.click(timeout=2000)
+                except Exception:
+                    campo.focus()                       # digita direto no campo, mesmo com algo por cima
             self._simular_humano()
             campo.fill("")
             try:
